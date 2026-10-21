@@ -69,12 +69,14 @@ For a dataset ``(X, y)`` and one outer fold of :func:`stratified_kfold`
    one ``validation_folds``-th is held out for early stopping and the
    threshold.
 2. **Inputs.**  Every raw column is standardised with the mean and standard
-   deviation of the training part, and a :class:`PCANormalizer` fitted on
-   the training part reduces the result to ``N`` components, each squashed
-   to ``(−π, π)`` (``π · tanh`` of the standardised component).  Test rows
-   enter neither fit.  **Component ``i`` is input ``i``, and input ``i``
-   sets the detuning of atom ``i``**, the atom at position ``(i · a, 0)`` of
-   the chain: neighbouring components sit on neighbouring atoms.
+   deviation of the training part (:func:`standardise_features`, so a
+   column constant there up to rounding is only centred), and a
+   :class:`PCANormalizer` fitted on the training part reduces the result to
+   ``N`` components, each squashed to ``(−π, π)`` (``π · tanh`` of the
+   standardised component).  Test rows enter neither fit.  **Component
+   ``i`` is input ``i``, and input ``i`` sets the detuning of atom ``i``**,
+   the atom at position ``(i · a, 0)`` of the chain: neighbouring
+   components sit on neighbouring atoms.
 3. **Oversampling.**  :func:`smote` on the training rows' inputs.  The
    synthetic rows are made once, in input space, so every arm trains on the
    same samples; validation and test rows are real rows only.
@@ -205,6 +207,13 @@ bytes removed, and exits without running the benchmark; files it cannot read as
 an entry (such as ``*.part`` files or entries from before #543) are listed and
 left untouched (#575).
 
+A power loss shortly after ``os.replace`` can still leave the final ``.npz`` entry empty or
+partially written.  On the next request, ``fetch`` treats an unreadable entry as a cache
+miss, warns, and recomputes the features, replacing the damaged entry.  This costs
+recomputation but does not return a false cache hit.  Calling ``fsync`` on every
+temporary file and the cache directory would add overhead to every write to guard
+against this rare failure, so the cache does not do so.
+
 What the key does not see: the platform string (as ``compare_environment``),
 the packages ``environment()`` does not record, such as a dependency of
 PennyLane or the BLAS behind NumPy, and a change of a recorded package that
@@ -265,7 +274,14 @@ point (``v_over_omega``, ``gamma_over_omega``, ``spacing_um``, ``omega``,
 the interaction-grid value from which an arm B record was reused across the
 grid, or ``null`` if the record was computed rather than reused; for reused
 records, ``feature_seconds``, ``train_seconds``, and ``tuning_seconds`` are
-all zero); ``measurement`` and ``shots``; the fold (``fold``, ``n_splits``,
+all zero, and ``feature_cache_hit``, ``feature_environment`` and the
+``feature_cache_hits`` and ``feature_environments`` of ``tuning`` are those
+of the record it was reused from: they say how the features both lines
+rest on were obtained when that record was computed.  Nothing is fetched
+for a reused line, and the cache holds no entry under its own
+``feature_map``, so its ``feature_cache_hit`` is ``false`` on a cold cache
+and ``true`` on a warm one, as its source line's is); ``measurement`` and
+``shots``; the fold (``fold``, ``n_splits``,
 ``train_idx``, ``val_idx``, ``test_idx`` as sorted row indices into the
 dataset, ``n_synthetic``); every seed (``seeds``); ``feature_dim``,
 ``n_parameters`` (trainable) and ``n_frozen_parameters``; the model's class
@@ -299,7 +315,13 @@ and the alignment do change.  On a training or test partition exceeding
 class-stratified subsample drawn with ``--separation-seed`` (default 0)
 to bound memory.  Train and test partitions are subsampled independently
 with the same seed, so on a large dataset the two parts can rest on
-different bases (e.g. train subsampled, test in full).
+different bases (e.g. train subsampled, test in full).  A limit of ``0``
+is no limit, and 1, 2 or a negative value is refused.  The subsample keeps
+each class's share of the part, and at least one row of it, so a small
+class can be left with a single row (5 positives among 1000 rows keep one
+at a limit of 20), which the line does not show; the Notes of
+:func:`hqnn_forge.diagnostics.separation_measures` say what that does to
+the measures.
 ``separation[part]['n_samples']`` records the actual number of rows used;
 the dataset's size and SHA-256; ``settings`` and ``environment``.
 
@@ -336,10 +358,12 @@ import hashlib
 import itertools
 import json
 import math
+import numbers
 import os
 import stat
 import tempfile
 import time
+import warnings
 import zipfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -396,8 +420,40 @@ DATASETS: tuple[str, ...] = (
 )
 #: Losses by name.  ``bce`` makes the linear head on the inputs a logistic regression.
 LOSSES: dict[str, Callable[[], nn.Module]] = {"bce": nn.BCEWithLogitsLoss, "focal": FocalLoss}
+
+
+#: Fewest rows the separation measures accept as a subsample limit (``max_rows`` of
+#: :func:`~hqnn_forge.diagnostics.separation_measures`).
+MIN_SEPARATION_ROWS = 3
+
+
+def _positive_integer(value: Any) -> bool:
+    return isinstance(value, numbers.Integral) and not isinstance(value, bool) and not value < 1
+
+
+def _positive_real(value: Any) -> bool:
+    return (
+        isinstance(value, numbers.Real)
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and not value <= 0
+    )
+
+
+#: Validation predicate and shared bound wording for each tunable training setting.
+TRAINING_SETTING_RULES: dict[str, tuple[Callable[[Any], bool], str]] = {
+    "lr": (_positive_real, "finite and > 0"),
+    "max_epochs": (_positive_integer, ">= 1"),
+    "batch_size": (_positive_integer, ">= 1"),
+    "patience": (
+        lambda value: value is None or _positive_integer(value),
+        ">= 1 or None",
+    ),
+}
+
 #: Training settings the shared search space may vary, as in ``hqnn_forge.benchmark``.
-TUNABLE: frozenset[str] = frozenset({"lr", "batch_size", "max_epochs", "patience"})
+TUNABLE: frozenset[str] = frozenset(TRAINING_SETTING_RULES)
+
 #: Rows a frozen circuit evaluates at a time.
 _CIRCUIT_CHUNK = 1024
 #: Axis of arm D's embedding rotation; the layer does not keep it, so its config reads it here.
@@ -472,7 +528,8 @@ class Settings:
         Root seed of every split, draw, initialisation and batch order.
     max_separation_rows:
         Maximum rows used to compute separation measures (pairwise distances
-        and linear kernel), or ``None`` to use all rows. Default 2000.
+        and linear kernel), an integer ``>= 3``, or ``None`` to use all rows.
+        Default 2000.  ``--max-separation-rows 0`` is ``None``.
     separation_seed:
         Seed for the class-stratified subsample draw when eligible rows
         exceed ``max_separation_rows``. Default 0.
@@ -525,15 +582,12 @@ class Settings:
             raise ValueError(f"hidden must be >= 1; got {self.hidden}.")
         if "D" in self.arms and self.circuit_layers < 1:
             raise ValueError(f"circuit_layers must be >= 1; got {self.circuit_layers}.")
-        if self.max_epochs < 1:
-            raise ValueError(f"max_epochs must be >= 1; got {self.max_epochs}.")
-        if self.patience is not None and self.patience < 1:
-            raise ValueError(f"patience must be None or >= 1; got {self.patience}.")
         # Also where tuning overrides them: a refused default should not depend on --trials.
-        if self.batch_size < 1:
-            raise ValueError(f"batch_size must be >= 1; got {self.batch_size}.")
-        if not 0 < self.lr < math.inf:  # NaN too
-            raise ValueError(f"lr must be finite and > 0; got {self.lr}.")
+        defaults = self.defaults
+        for key, (predicate, bound) in TRAINING_SETTING_RULES.items():
+            value = defaults[key]
+            if not predicate(value):
+                raise ValueError(f"{key} must be {bound}; got {value!r}.")
         if not self.v_over_omega or min(self.v_over_omega) <= 0:
             raise ValueError(f"v_over_omega needs values > 0; got {self.v_over_omega}.")
         if not self.gamma_over_omega or min(self.gamma_over_omega) < 0:
@@ -557,27 +611,19 @@ class Settings:
         empty = sorted(k for k, values in self.search_space.items() if len(values) == 0)
         if empty:
             raise ValueError(f"no values to draw from for {empty}.")
-        batch_sizes = self.search_space.get("batch_size", ())
-        if any(value < 1 for value in batch_sizes):
+
+        for key, values in self.search_space.items():
+            predicate, bound = TRAINING_SETTING_RULES[key]
+            if not all(predicate(value) for value in values):
+                raise ValueError(
+                    f"search_space['{key}'] values must be {bound}; got {list(values)!r}."
+                )
+
+        rows = self.max_separation_rows
+        if rows is not None and not (_positive_integer(rows) and rows >= MIN_SEPARATION_ROWS):
             raise ValueError(
-                f"search_space['batch_size'] must hold values >= 1; got {list(batch_sizes)}."
-            )
-        rates = self.search_space.get("lr", ())
-        if any(not 0 < value < math.inf for value in rates):
-            raise ValueError(f"search_space['lr'] must hold finite values > 0; got {list(rates)}.")
-        epochs = self.search_space.get("max_epochs", ())
-        if any(value is None or value < 1 for value in epochs):
-            raise ValueError(
-                f"search_space['max_epochs'] must hold values >= 1; got {list(epochs)}."
-            )
-        patiences = self.search_space.get("patience", ())
-        if any(value is not None and value < 1 for value in patiences):
-            raise ValueError(
-                f"search_space['patience'] must hold values >= 1 or None; got {list(patiences)}."
-            )
-        if self.max_separation_rows is not None and self.max_separation_rows < 3:
-            raise ValueError(
-                f"max_separation_rows must be >= 3 or None; got {self.max_separation_rows}."
+                f"max_separation_rows must be an integer >= {MIN_SEPARATION_ROWS} or None; "
+                f"got {rows!r}."
             )
 
     @property
@@ -862,9 +908,15 @@ def preprocess(X: FloatArray, fit_rows: RowArray, n_components: int) -> FloatArr
     """
     The bounded inputs of every row of ``X``, fitted on ``fit_rows`` only.
 
-    Each column is standardised with the mean and standard deviation of
-    ``X[fit_rows]`` (a constant column is only centred), and a
-    :class:`PCANormalizer` fitted on those rows projects onto their first
+    Each raw column is standardised by :func:`standardise_features` with
+    ``fit_rows``: centred and divided by its population standard deviation
+    on ``X[fit_rows]``.  A column constant on those rows, which by the rule
+    of :func:`standardise_features` ("Constant columns") includes a computed
+    variance at or below its rounding bound and not only ``σ = 0``, is only
+    centred, so its rounding noise stays at that size and takes no
+    principal component (#580).  Steps 2 and 4 of the module docstring
+    therefore share one constant rule.  A :class:`PCANormalizer` fitted on
+    the fitting rows of the result projects onto their first
     ``n_components`` principal components, standardises each and squashes it
     with ``π · tanh``.
 
@@ -874,11 +926,14 @@ def preprocess(X: FloatArray, fit_rows: RowArray, n_components: int) -> FloatArr
         Shape ``(n_samples, n_components)``, float64, in ``(−π, π)`` (at
         the float32 precision ``PCANormalizer`` returns).  Column ``i`` is
         component ``i``, in order of decreasing variance.
+
+    Raises
+    ------
+    ValueError
+        As :func:`standardise_features` (a value on ``fit_rows`` that is not
+        finite, say) and :meth:`PCANormalizer.fit`.
     """
-    mean = X[fit_rows].mean(axis=0)
-    std = X[fit_rows].std(axis=0)
-    std[std == 0] = 1.0
-    scaled = (X - mean) / std
+    scaled = standardise_features(X, fit_rows)
     normalizer = PCANormalizer(n_components=n_components, scale_to_pi=True)
     normalizer.fit(scaled[fit_rows])
     inputs: FloatArray = normalizer.transform(scaled).double().numpy()
@@ -1404,6 +1459,23 @@ class PruneReport(NamedTuple):
     unreadable: tuple[Path, ...]
 
 
+_ENTRY_ERRORS = (
+    OSError,
+    EOFError,
+    ValueError,
+    KeyError,
+    TypeError,
+    zipfile.BadZipFile,
+)
+
+
+def _stored_environment(stored: Mapping[str, Any]) -> dict[str, Any]:
+    environment = json.loads(str(stored["environment"]))
+    if not isinstance(environment, dict):
+        raise TypeError("the stored environment is not a JSON object")
+    return environment
+
+
 class FeatureCache:
     """
     Features on disk, one ``.npz`` file per input matrix, feature-map
@@ -1494,14 +1566,24 @@ class FeatureCache:
         ``compute(inputs)``, timed and stored with this cache's environment.
         """
         path = self.path(inputs, labels, config)
-        if path is not None and path.exists():
-            with np.load(path, allow_pickle=False) as stored:
-                return CachedFeatures(
-                    np.asarray(stored["features"], dtype=np.float64),
-                    float(stored["seconds"]),
-                    True,
-                    json.loads(str(stored["environment"])),
+        if path is not None:
+            try:
+                with np.load(path, allow_pickle=False) as stored:
+                    return CachedFeatures(
+                        np.asarray(stored["features"], dtype=np.float64),
+                        float(stored["seconds"]),
+                        True,
+                        _stored_environment(stored),
+                    )
+            except FileNotFoundError:
+                pass
+            except _ENTRY_ERRORS as error:
+                warnings.warn(
+                    f"feature cache entry {path} is unreadable ({error!r}); recomputing",
+                    RuntimeWarning,
+                    stacklevel=2,
                 )
+
         start = time.perf_counter()
         features = np.ascontiguousarray(compute(inputs), dtype=np.float64)
         seconds = time.perf_counter() - start
@@ -1559,16 +1641,10 @@ class FeatureCache:
                     if entry_code != self.code_sha256:
                         is_stale = True
                     else:
-                        if "environment" not in stored:
-                            unreadable.append(path)
-                            continue
-                        raw_env = json.loads(str(stored["environment"]))
-                        if not isinstance(raw_env, dict):
-                            unreadable.append(path)
-                            continue
+                        raw_env = _stored_environment(stored)
                         entry_key_env = key_environment(raw_env)
                         is_stale = entry_key_env != current_key_env
-            except (OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile, EOFError):
+            except _ENTRY_ERRORS:
                 unreadable.append(path)
                 continue
 
@@ -1605,7 +1681,9 @@ def standardise_features(features: npt.ArrayLike, fit_rows: RowArray) -> FloatAr
 
     Step 4 of the module docstring: :func:`run_dataset` passes each
     split's real training rows (:attr:`Split.real_train`) unless
-    ``Settings.standardise`` is off.
+    ``Settings.standardise`` is off.  Step 2 as well: :func:`preprocess`
+    standardises the raw columns with it, on the rows its PCA is fitted on
+    (an outer fold's training part, a tuning fold's fitting rows).
 
     Definition
     ----------
@@ -1618,13 +1696,13 @@ def standardise_features(features: npt.ArrayLike, fit_rows: RowArray) -> FloatAr
         σ_j² = (1/n) Σ_{r ∈ R} (F[r, j] − μ_j)²
         Z[r, j] = (F[r, j] − μ_j) / σ_j          for every row r
 
-    with the population variance (``1/n``, not ``1/(n − 1)``), as
-    :func:`preprocess` scales the raw columns.  A column that is constant
-    on the fitting rows is only centred (``σ_j`` is replaced by 1; see
-    "Constant columns" below).  ``Z`` is dimensionless whatever the unit of
-    ``F``; on the fitting rows each column of ``Z`` has mean 0 and, unless
-    it is constant there, variance 1.  Rows outside ``R`` enter neither
-    ``μ`` nor ``σ``: changing one changes that row of ``Z`` and no other.
+    with the population variance (``1/n``, not ``1/(n − 1)``).  A column
+    that is constant on the fitting rows is only centred (``σ_j`` is
+    replaced by 1; see "Constant columns" below).  ``Z`` is dimensionless
+    whatever the unit of ``F``; on the fitting rows each column of ``Z`` has
+    mean 0 and, unless it is constant there, variance 1.  Rows outside ``R``
+    enter neither ``μ`` nor ``σ``: changing one changes that row of ``Z``
+    and no other.
 
     What it removes
     ---------------
@@ -2217,8 +2295,24 @@ def run_dataset(
                 arm_b_cache[rep.gamma_over_omega] = arm_b_records
 
 
+def _mean_seconds(rows: Sequence[Mapping[str, Any]], name: str, width: int) -> str:
+    """The mean of ``name`` over ``rows`` as a column of ``width``, or ``-`` without a row."""
+    if not rows:
+        return format("-", f">{width}s")
+    return format(float(np.mean([r[name] for r in rows])), f"{width}.2f")
+
+
 def summarise(records: Sequence[Mapping[str, Any]]) -> str:
-    """Mean and fold spread of MCC and PR-AUC per dataset, arm, head and grid point."""
+    """
+    Mean and fold spread of MCC and PR-AUC per dataset, arm, head and grid point.
+
+    ``feat s`` and ``fit s`` are the mean ``feature_seconds`` and
+    ``train_seconds`` of the lines that were computed: a reused arm B line
+    (``reused_from_v_over_omega`` not ``null``) has both at 0 and is left
+    out, and a row whose lines are all reused shows ``-``.  The cost of arm B
+    is therefore in the row of the ``V/Ω`` it was computed at: the first
+    value given to ``--v-over-omega``, which need not be the smallest.
+    """
     groups: dict[tuple[Any, ...], list[Mapping[str, Any]]] = {}
     for record in records:
         key = (
@@ -2235,6 +2329,7 @@ def summarise(records: Sequence[Mapping[str, Any]]) -> str:
     )
     lines = [header]
     for (dataset, v, gamma, arm, head), rows in groups.items():
+        computed = [r for r in rows if r.get("reused_from_v_over_omega") is None]
         mcc = np.array([r["mcc"] for r in rows], dtype=np.float64)
         spread = mcc.std(ddof=1) if len(rows) > 1 else 0.0
         ap = float(np.mean([r["pr_auc"] for r in rows]))
@@ -2243,10 +2338,34 @@ def summarise(records: Sequence[Mapping[str, Any]]) -> str:
             f"{'-' if gamma is None else format(gamma, 'g'):>6s} {arm:8s} {head:6s} "
             f"{mcc.mean():7.3f} ± {spread:5.3f} {ap:7.3f} {rows[0]['feature_dim']:4d} "
             f"{rows[0]['n_parameters']:6d} "
-            f"{np.mean([r['feature_seconds'] for r in rows]):7.2f} "
-            f"{np.mean([r['train_seconds'] for r in rows]):6.2f}  {len(rows)}"
+            f"{_mean_seconds(computed, 'feature_seconds', 7)} "
+            f"{_mean_seconds(computed, 'train_seconds', 6)}  {len(rows)}"
         )
     return "\n".join(lines)
+
+
+_WINDOWS = os.name == "nt"
+
+
+def _filename_limit(directory: Path) -> int:
+    """
+    Return the longest filename ``directory``'s filesystem allows, or ``-1`` if unknown.
+
+    The unit is that of :func:`_filename_length`.
+    """
+    try:
+        return os.pathconf(directory, "PC_NAME_MAX")
+    except (AttributeError, OSError, ValueError):
+        # Windows has no pathconf; its filesystems allow 255 UTF-16 code units.
+        return 255 if _WINDOWS else -1
+
+
+def _filename_length(name: str) -> int:
+    """Measure ``name`` in the filesystem's own unit: UTF-16 code units on Windows, else bytes."""
+    if _WINDOWS:
+        # "surrogatepass" keeps the unpaired surrogates that Windows filenames may hold.
+        return len(name.encode("utf-16-le", "surrogatepass")) // 2
+    return len(os.fsencode(name))
 
 
 def check_writable(out: str | os.PathLike[str]) -> None:
@@ -2260,11 +2379,13 @@ def check_writable(out: str | os.PathLike[str]) -> None:
     Other existing targets are probed by opening them for appending too.
     For a new file a temporary file is created in its directory and removed,
     keeping the output basename in the probe's prefix unless it would exceed
-    ``PC_NAME_MAX`` with the eight random characters appended.  The output
-    basename's byte length is checked against that limit where available;
-    an unavailable filesystem limit is ignored.  Errors become a ``ValueError``
-    naming ``out``: a missing directory, a directory in its place, no write
-    permission, or a name that is too long.
+    the filename limit with the eight random characters appended.  The limit
+    is ``PC_NAME_MAX`` where the platform provides it, and 255 UTF-16 code
+    units on Windows, which has no ``os.pathconf``; names are measured in
+    bytes, or in UTF-16 code units on Windows.  The output basename is checked
+    against that limit; where no limit is available it is ignored.  Errors
+    become a ``ValueError`` naming ``out``: a missing directory, a directory in
+    its place, no write permission, or a name that is too long.
 
     Checked up front rather than by writing to a temporary file renamed over
     ``out`` at the end: :func:`run` writes each record as it comes, so that
@@ -2287,14 +2408,11 @@ def check_writable(out: str | os.PathLike[str]) -> None:
             with open(path, "a", encoding="utf-8"):
                 pass
         else:
-            try:
-                name_max = os.pathconf(path.parent, "PC_NAME_MAX")
-            except (AttributeError, OSError, ValueError):
-                name_max = -1
-            if name_max > 0 and len(os.fsencode(path.name)) > name_max:
+            name_max = _filename_limit(path.parent)
+            if name_max > 0 and _filename_length(path.name) > name_max:
                 raise OSError(errno.ENAMETOOLONG, os.strerror(errno.ENAMETOOLONG), str(path))
             prefix = f".{path.name}."
-            if name_max > 0 and len(os.fsencode(prefix)) + 8 > name_max:
+            if name_max > 0 and _filename_length(prefix) + 8 > name_max:
                 prefix = ".out."
             with tempfile.NamedTemporaryFile(dir=path.parent, prefix=prefix):
                 pass
@@ -2540,7 +2658,11 @@ def _parser() -> argparse.ArgumentParser:
         "--max-separation-rows",
         type=int,
         default=default.max_separation_rows,
-        help="maximum rows for separation measures (<= 0 for full data; floor 3)",
+        help=(
+            "rows of a training or test part above which its separation measures are computed "
+            "on a class-stratified subsample of that many rows: an integer "
+            f">= {MIN_SEPARATION_ROWS}, or 0 for no limit"
+        ),
     )
     parser.add_argument(
         "--separation-seed",
@@ -2584,11 +2706,13 @@ def main(argv: Sequence[str] | None = None) -> list[dict[str, Any]]:
                 f"unreadable cache files (not removed): {', '.join(p.name for p in report.unreadable)}"
             )
         return []
-    max_sep = (
-        None
-        if args.max_separation_rows is not None and args.max_separation_rows <= 0
-        else args.max_separation_rows
-    )
+    # 0 is the one spelling of "no limit": a negative value is a typo, not a second one.
+    if args.max_separation_rows < 0 or 0 < args.max_separation_rows < MIN_SEPARATION_ROWS:
+        parser.error(
+            "argument --max-separation-rows: must be 0 (no limit) or an integer "
+            f">= {MIN_SEPARATION_ROWS}; got {args.max_separation_rows}"
+        )
+    max_sep = args.max_separation_rows or None
     if args.quick:
         settings = dataclasses.replace(
             QUICK,
