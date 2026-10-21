@@ -37,7 +37,7 @@ def _register_stub_plugin_device(
 
     if explicit_seed:
 
-        class StubPluginDevice(qml.devices.Device):
+        class ExplicitSeedStubDevice(qml.devices.Device):
             def __init__(self, wires: int, seed: int | None = None) -> None:
                 received_kwargs.append({"seed": seed})
                 super().__init__(wires=wires)
@@ -49,9 +49,11 @@ def _register_stub_plugin_device(
             def execute(self, circuits: Any, execution_config: Any = None) -> Any:
                 raise NotImplementedError
 
+        device_class: type[qml.devices.Device] = ExplicitSeedStubDevice
+
     else:
 
-        class StubPluginDevice(qml.devices.Device):
+        class KwargsOnlyStubDevice(qml.devices.Device):
             def __init__(self, wires: int, **kwargs: object) -> None:
                 received_kwargs.append(kwargs)
                 super().__init__(wires=wires)
@@ -63,9 +65,11 @@ def _register_stub_plugin_device(
             def execute(self, circuits: Any, execution_config: Any = None) -> Any:
                 raise NotImplementedError
 
+        device_class = KwargsOnlyStubDevice
+
     class StubEntryPoint:
-        def load(self) -> type[StubPluginDevice]:
-            return StubPluginDevice
+        def load(self) -> type[qml.devices.Device]:
+            return device_class
 
     monkeypatch.setitem(qml.plugin_devices, device_name, StubEntryPoint())
     return received_kwargs
