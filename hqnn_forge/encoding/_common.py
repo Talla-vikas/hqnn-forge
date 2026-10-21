@@ -552,8 +552,11 @@ def resolve_device(
         ``numpy.random.seed`` controls it: pass ``seed`` for repeatable
         shot-based results.  ``default.qubit``,
         ``default.mixed`` and the lightning devices honour it.  Other plugins
-        receive an explicit seed as given, while ``None`` leaves their default
-        unchanged (they need not accept a ``seed`` keyword).  See ``validate_seed``.
+        do not receive ``seed``; use the plugin's own seeding option instead.
+        Braket Local (Braket plugin 1.35.2) accepts a forwarded seed at
+        construction but fails during execution because its simulator rejects
+        it, while Qiskit Aer and BasicSimulator (PennyLane-Qiskit 0.45.0) warn
+        that the option is unused.  See ``validate_seed``.
 
     Returns
     -------
@@ -580,10 +583,14 @@ def resolve_device(
         itself is broken.
     """
     seed = validate_seed(seed)
-    kwargs: dict[str, object] = {"seed": seed}
-    if seed is None and device_name not in _SEED_NONE_DEVICES:
-        # A plugin need not accept a seed keyword: leave its default alone.
-        kwargs = {}
+    kwargs: dict[str, object] = {"seed": seed} if device_name in _SEED_NONE_DEVICES else {}
+    if seed is not None and device_name not in _SEED_NONE_DEVICES:
+        warnings.warn(
+            f"The seed was not forwarded to device '{device_name}'; "
+            "use the plugin's own seeding option instead.",
+            UserWarning,
+            stacklevel=_stacklevel_outside_package(),
+        )
     if device_name not in KNOWN_DEVICES:
         dev = qml.device(device_name, wires=n_qubits, **kwargs)
         logger.debug("Quantum device initialised: %s (%d qubits)", device_name, n_qubits)

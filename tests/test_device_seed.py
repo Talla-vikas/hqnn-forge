@@ -7,8 +7,10 @@ layers and classifiers, and SPSA's common random numbers for shot noise.
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable
 from contextlib import AbstractContextManager
+from typing import Any
 
 import numpy as np
 import pytest
@@ -23,6 +25,34 @@ from hqnn_forge.training.spsa import device_generators
 from hqnn_forge.utils import load_checkpoint, save_checkpoint
 
 SHOTS = 50
+
+
+def _register_stub_plugin_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[dict[str, object]]:
+    import pennylane as qml
+
+    received_kwargs: list[dict[str, object]] = []
+    device_name = "test.seed_stub"
+
+    class StubPluginDevice(qml.devices.Device):
+        def __init__(self, wires: int, **kwargs: object) -> None:
+            received_kwargs.append(kwargs)
+            super().__init__(wires=wires)
+
+        @property
+        def name(self) -> str:
+            return device_name
+
+        def execute(self, circuits: Any, execution_config: Any = None) -> Any:
+            raise NotImplementedError
+
+    class StubEntryPoint:
+        def load(self) -> type[StubPluginDevice]:
+            return StubPluginDevice
+
+    monkeypatch.setitem(qml.plugin_devices, device_name, StubEntryPoint())
+    return received_kwargs
 
 
 def _model(seed: int | None, *, torch_seed: int = 0, **kwargs) -> HybridBinaryClassifier:
@@ -83,10 +113,39 @@ class TestSeed:
         dev = resolve_device("plugin.without.seed", 2)
         np.testing.assert_array_equal(dev._rng.random(5), np.random.default_rng(11).random(5))
 
+    def test_explicit_seed_is_dropped_for_plugin_and_warns(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        received_kwargs = _register_stub_plugin_device(monkeypatch)
+
+        with pytest.warns(
+            UserWarning, match=r"test\.seed_stub.*plugin's own seeding option"
+        ) as warn:
+            resolve_device("test.seed_stub", 2, seed=7)
+
+        assert len(warn) == 1
+        assert received_kwargs == [{}]
+
+    def test_none_seed_is_dropped_for_plugin_without_warning(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        received_kwargs = _register_stub_plugin_device(monkeypatch)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            resolve_device("test.seed_stub", 2, seed=None)
+
+        assert not caught
+        assert received_kwargs == [{}]
+
     def test_seed_reaches_the_device(self) -> None:
         (rng,) = device_generators(_model(11))
         reference = np.random.default_rng(11)
         assert rng.bit_generator.state == reference.bit_generator.state
+
+    def test_seeded_builtin_device_still_uses_the_seed(self) -> None:
+        dev = resolve_device("default.qubit", 2, seed=11)
+        np.testing.assert_array_equal(dev._rng.random(5), np.random.default_rng(11).random(5))
 
     def test_layer_takes_a_seed_and_shows_it(self) -> None:
         layer = QuantumEncodingLayer(n_qubits=2, n_layers=1, shots=SHOTS, seed=5)
