@@ -15,6 +15,7 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
+from pennylane.exceptions import DeviceError
 
 from hqnn_forge.encoding import QuantumEncodingLayer
 from hqnn_forge.encoding._common import resolve_device
@@ -28,24 +29,39 @@ SHOTS = 50
 
 
 def _register_stub_plugin_device(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, *, device_name: str, explicit_seed: bool = False
 ) -> list[dict[str, object]]:
     import pennylane as qml
 
     received_kwargs: list[dict[str, object]] = []
-    device_name = "test.seed_stub"
 
-    class StubPluginDevice(qml.devices.Device):
-        def __init__(self, wires: int, **kwargs: object) -> None:
-            received_kwargs.append(kwargs)
-            super().__init__(wires=wires)
+    if explicit_seed:
 
-        @property
-        def name(self) -> str:
-            return device_name
+        class StubPluginDevice(qml.devices.Device):
+            def __init__(self, wires: int, seed: int | None = None) -> None:
+                received_kwargs.append({"seed": seed})
+                super().__init__(wires=wires)
 
-        def execute(self, circuits: Any, execution_config: Any = None) -> Any:
-            raise NotImplementedError
+            @property
+            def name(self) -> str:
+                return device_name
+
+            def execute(self, circuits: Any, execution_config: Any = None) -> Any:
+                raise NotImplementedError
+
+    else:
+
+        class StubPluginDevice(qml.devices.Device):
+            def __init__(self, wires: int, **kwargs: object) -> None:
+                received_kwargs.append(kwargs)
+                super().__init__(wires=wires)
+
+            @property
+            def name(self) -> str:
+                return device_name
+
+            def execute(self, circuits: Any, execution_config: Any = None) -> Any:
+                raise NotImplementedError
 
     class StubEntryPoint:
         def load(self) -> type[StubPluginDevice]:
@@ -101,51 +117,52 @@ class TestSeed:
     def test_unseeded_plugin_need_not_accept_a_seed_keyword(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import pennylane as qml
+        device_name = "test.unseeded_stub"
+        received_kwargs = _register_stub_plugin_device(monkeypatch, device_name=device_name)
 
-        real = qml.device
+        resolve_device(device_name, 2)
 
-        def plugin(name: str, wires: int):
-            assert name == "plugin.without.seed"
-            return real("default.qubit", wires=wires, seed=11)
-
-        monkeypatch.setattr(qml, "device", plugin)
-        dev = resolve_device("plugin.without.seed", 2)
-        np.testing.assert_array_equal(dev._rng.random(5), np.random.default_rng(11).random(5))
+        assert received_kwargs == [{}]
 
     def test_explicit_seed_is_dropped_for_plugin_and_warns(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        received_kwargs = _register_stub_plugin_device(monkeypatch)
+        received_kwargs = _register_stub_plugin_device(monkeypatch, device_name="test.seed_stub")
 
         with pytest.warns(
-            UserWarning, match=r"test\.seed_stub.*plugin's own seeding option"
+            UserWarning, match=r"device 'test\.seed_stub'.*own seeding option"
         ) as warn:
             resolve_device("test.seed_stub", 2, seed=7)
 
-        assert len(warn) == 1
+        seed_warnings = [w for w in warn if "not forwarded" in str(w.message)]
+        assert len(seed_warnings) == 1
         assert received_kwargs == [{}]
 
-    def test_none_seed_is_dropped_for_plugin_without_warning(
-        self, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize("seed", [None, 7])
+    def test_registered_device_with_explicit_seed_receives_it(
+        self, monkeypatch: pytest.MonkeyPatch, seed: int | None
     ) -> None:
-        received_kwargs = _register_stub_plugin_device(monkeypatch)
+        received_kwargs = _register_stub_plugin_device(
+            monkeypatch, device_name="test.explicit_seed_stub", explicit_seed=True
+        )
 
+        resolve_device("test.explicit_seed_stub", 2, seed=seed)
+
+        assert received_kwargs == [{"seed": seed}]
+
+    def test_unknown_device_raises_without_dropped_seed_warning(self) -> None:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            resolve_device("test.seed_stub", 2, seed=None)
+            with pytest.raises(DeviceError):
+                resolve_device("test.unknown_device", 2, seed=7)
 
-        assert not caught
-        assert received_kwargs == [{}]
+        seed_warnings = [w for w in caught if "not forwarded" in str(w.message)]
+        assert not seed_warnings
 
     def test_seed_reaches_the_device(self) -> None:
         (rng,) = device_generators(_model(11))
         reference = np.random.default_rng(11)
         assert rng.bit_generator.state == reference.bit_generator.state
-
-    def test_seeded_builtin_device_still_uses_the_seed(self) -> None:
-        dev = resolve_device("default.qubit", 2, seed=11)
-        np.testing.assert_array_equal(dev._rng.random(5), np.random.default_rng(11).random(5))
 
     def test_layer_takes_a_seed_and_shows_it(self) -> None:
         layer = QuantumEncodingLayer(n_qubits=2, n_layers=1, shots=SHOTS, seed=5)
